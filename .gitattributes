@@ -1,0 +1,12 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Python
+*.py text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+.gitignore text eol=lf
+.env.example text eol=lf
+
+# Docker
+Dockerfile text eol=lf

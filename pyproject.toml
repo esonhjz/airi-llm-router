@@ -1,0 +1,17 @@
+[project]
+name = "airi-llm-router"
+version = "0.1.0"
+description = "Async LLM Router for Airi"
+authors = [
+    { name = "esonhjz", email = "hyh20080809@gmail.com" }
+]
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "pydantic-settings",
+    "httpx[http2]",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
