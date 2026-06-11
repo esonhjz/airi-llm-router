@@ -2,8 +2,9 @@ from contextlib import asynccontextmanager
 
 import httpx
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from src.config import settings
 from src.router.dispatch import router as dispatch_router
@@ -52,6 +53,49 @@ app.add_middleware(
 )
 
 app.include_router(dispatch_router)
+
+
+@app.exception_handler(httpx.RequestError)
+async def upstream_connection_error_handler(request: Request, exc: httpx.RequestError):
+    """Handles connection errors to the upstream LLM provider."""
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": {
+                "message": f"Failed to connect to upstream LLM provider: {str(exc)}",
+                "type": "server_error",
+                "param": None,
+                "code": "upstream_connection_failed"
+            }
+        }
+    )
+
+
+@app.exception_handler(httpx.HTTPStatusError)
+async def upstream_status_error_handler(request: Request, exc: httpx.HTTPStatusError):
+    """Handles HTTP errors returned by the upstream LLM provider."""
+    status_code = exc.response.status_code
+    
+    try:
+        upstream_error = exc.response.json()
+        if "error" in upstream_error:
+            return JSONResponse(status_code=status_code, content=upstream_error)
+    except Exception:
+        pass
+        
+    error_msg = exc.response.text or str(exc)
+        
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "message": f"Upstream LLM error: {error_msg}",
+                "type": "api_error",
+                "param": None,
+                "code": "upstream_api_error"
+            }
+        }
+    )
 
 
 @app.get("/health")

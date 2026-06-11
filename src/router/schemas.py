@@ -1,21 +1,23 @@
-from typing import Any
+from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, Field
 
 class ContentPartText(BaseModel):
-    type: str = "text"
+    type: Literal["text"] = "text"
     text: str
 
 class ImageUrl(BaseModel):
     url: str
 
 class ContentPartImage(BaseModel):
-    type: str = "image_url"
+    type: Literal["image_url"] = "image_url"
     image_url: ImageUrl
+
+ContentPart = Annotated[Union[ContentPartText, ContentPartImage], Field(discriminator="type")]
 
 class ChatMessage(BaseModel):
     role: str
-    content: str | list[dict[str, Any]]
+    content: str | list[ContentPart]
 
 class ChatCompletionRequest(BaseModel):
     """OpenAI-compatible Chat Completions request model."""

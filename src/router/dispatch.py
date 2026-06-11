@@ -47,11 +47,34 @@ async def _stream_upstream(client: httpx.AsyncClient, payload: dict[str, Any]):
     }
     url = f"{settings.llm_base_url.rstrip('/')}/chat/completions"
 
-    async with client.stream("POST", url, json=payload, headers=headers) as response:
-        response.raise_for_status()
-        async for line in response.aiter_lines():
-            if line.strip():
-                yield f"{line}\n\n"
+    try:
+        async with client.stream("POST", url, json=payload, headers=headers) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if line.strip():
+                    yield f"{line}\n\n"
+    except httpx.HTTPError as exc:
+        if isinstance(exc, httpx.HTTPStatusError):
+            try:
+                upstream_error = exc.response.json()
+                if "error" in upstream_error:
+                    yield f"{json.dumps(upstream_error)}\n\n"
+                    return
+            except Exception:
+                pass
+            error_msg = exc.response.text or str(exc)
+        else:
+            error_msg = f"Connection failed: {str(exc)}"
+            
+        fallback_error = {
+            "error": {
+                "message": f"Upstream LLM error: {error_msg}",
+                "type": "api_error",
+                "param": None,
+                "code": "upstream_api_error"
+            }
+        }
+        yield f"{json.dumps(fallback_error)}\n\n"
 
 @router.post("/chat/completions")
 async def chat_completions(body: ChatCompletionRequest, request: Request):
