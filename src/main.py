@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+import asyncio
+import time
 from contextlib import asynccontextmanager
 
 import httpx
@@ -7,12 +11,123 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from src.config import settings
+from src.queue.worker import queue_consumer, queue_status
 from src.router.dispatch import router as dispatch_router
 
 
+# ---------------------------------------------------------------------------
+# Startup warmup
+# ---------------------------------------------------------------------------
+
+async def _probe_upstream(client: httpx.AsyncClient) -> None:
+    """
+    Sends a minimal single-token request to the upstream LLM to:
+      1. Verify the upstream is reachable (health probe).
+      2. Force the model into VRAM so the first real request is not cold.
+
+    Retry policy:
+      - Exponential backoff: delay = min(base * 2^attempt, total_timeout / 2)
+      - Maximum `warmup_max_retries` attempts within `warmup_total_timeout` seconds.
+      - On final failure, logs a warning and returns — never raises.
+        The gateway continues to start normally; warmup failure is not fatal.
+    """
+    url = f"{settings.llm_base_url.rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {settings.llm_api_key}",
+        "Content-Type": "application/json",
+    }
+    # Minimal payload: one token of output is enough to force model loading.
+    payload = {
+        "model": settings.llm_default_model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+        "stream": False,
+    }
+
+    for attempt in range(settings.warmup_max_retries):
+        try:
+            t0 = time.monotonic()
+            resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            elapsed = time.monotonic() - t0
+            print(
+                f"[Warmup] ✅ Model '{settings.llm_default_model}' loaded into VRAM "
+                f"({elapsed:.2f}s, attempt {attempt + 1}/{settings.warmup_max_retries})"
+            )
+            return  # success
+
+        except Exception as exc:
+            remaining_attempts = settings.warmup_max_retries - attempt - 1
+            if remaining_attempts == 0:
+                # Final attempt failed — log and give up gracefully
+                print(
+                    f"[Warmup] ❌ All {settings.warmup_max_retries} probe attempts failed. "
+                    f"Last error: {type(exc).__name__}: {exc}. "
+                    "Gateway will start anyway — model may have a cold start on first request."
+                )
+                return
+
+            # Exponential backoff capped at half the total timeout budget
+            delay = min(
+                settings.warmup_retry_base_delay * (2 ** attempt),
+                settings.warmup_total_timeout / 2,
+            )
+            print(
+                f"[Warmup] ⚠️  Probe attempt {attempt + 1}/{settings.warmup_max_retries} failed "
+                f"({type(exc).__name__}). Retrying in {delay:.1f}s..."
+            )
+            await asyncio.sleep(delay)
+
+
+async def _run_warmup(client: httpx.AsyncClient) -> None:
+    """
+    Wraps _probe_upstream in an overall timeout guard.
+    If the total warmup budget is exceeded (e.g. Ollama is completely offline),
+    the coroutine is cancelled and a warning is printed.
+    """
+    if not settings.warmup_enabled:
+        print("[Warmup] Skipped (warmup_enabled=False)")
+        return
+
+    print(
+        f"[Warmup] 🔥 Probing upstream '{settings.llm_default_model}' "
+        f"(timeout={settings.warmup_total_timeout:.0f}s, "
+        f"max_retries={settings.warmup_max_retries})..."
+    )
+    try:
+        await asyncio.wait_for(
+            _probe_upstream(client),
+            timeout=settings.warmup_total_timeout,
+        )
+    except asyncio.TimeoutError:
+        print(
+            f"[Warmup] ❌ Probe timed out after {settings.warmup_total_timeout:.0f}s. "
+            "Gateway starting without VRAM pre-heat."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Application lifespan
+# ---------------------------------------------------------------------------
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manages the global async HTTP connection pool to prevent frequent reconnections."""
+    """
+    Manages the full application lifecycle in three phases:
+
+    Startup
+    ───────
+    1. Create the global HTTP connection pool (shared by all routes and workers).
+    2. Run the upstream warmup probe to verify connectivity and pre-load VRAM.
+       Warmup is non-blocking: even if it fails the gateway opens for traffic.
+    3. Spawn N background queue consumer workers.
+
+    Shutdown
+    ────────
+    4. Cancel all workers and await their clean exit.
+    5. Close the HTTP connection pool.
+    """
+    # Phase 1 — Connection pool
     pool_limits = httpx.Limits(
         max_connections=settings.pool_max_connections,
         max_keepalive_connections=settings.pool_max_keepalive,
@@ -23,7 +138,6 @@ async def lifespan(app: FastAPI):
         write=settings.pool_write_timeout,
         pool=settings.pool_connect_timeout,
     )
-
     client = httpx.AsyncClient(
         limits=pool_limits,
         timeout=timeout,
@@ -31,16 +145,51 @@ async def lifespan(app: FastAPI):
         follow_redirects=True,
     )
     app.state.http_client = client
-
     print(f"[Lifespan] 🚀 Connection pool ready (max_conn={settings.pool_max_connections}, http2=True)")
-    yield
+
+    # Phase 2 — Warmup probe (non-blocking: launched as a background task so
+    # the gateway starts serving traffic while the probe retries in the background)
+    warmup_task = asyncio.create_task(_run_warmup(client))
+    app.state.warmup_task = warmup_task
+
+    # Phase 3 — Queue workers
+    workers: list[asyncio.Task] = []
+    for i in range(settings.queue_worker_count):
+        t = asyncio.create_task(queue_consumer(client, worker_id=i))
+        workers.append(t)
+    print(
+        f"[Lifespan] 🏭 {settings.queue_worker_count} queue workers launched "
+        f"(max_queue={settings.queue_max_size})"
+    )
+
+    yield  # ── gateway is live ──
+
+    # Phase 4 — Cancel workers
+    for t in workers:
+        t.cancel()
+    await asyncio.gather(*workers, return_exceptions=True)
+    print("[Lifespan] 🛑 All queue workers stopped")
+
+    # Cancel warmup if still running (e.g. gateway stopped almost immediately)
+    if not warmup_task.done():
+        warmup_task.cancel()
+        try:
+            await warmup_task
+        except asyncio.CancelledError:
+            pass
+
+    # Phase 5 — Connection pool teardown
     await client.aclose()
     print("[Lifespan] 🛑 Connection pool released")
 
 
+# ---------------------------------------------------------------------------
+# FastAPI application
+# ---------------------------------------------------------------------------
+
 app = FastAPI(
     title=settings.app_name,
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -55,6 +204,10 @@ app.add_middleware(
 app.include_router(dispatch_router)
 
 
+# ---------------------------------------------------------------------------
+# Global exception handlers
+# ---------------------------------------------------------------------------
+
 @app.exception_handler(httpx.RequestError)
 async def upstream_connection_error_handler(request: Request, exc: httpx.RequestError):
     """Handles connection errors to the upstream LLM provider."""
@@ -65,9 +218,9 @@ async def upstream_connection_error_handler(request: Request, exc: httpx.Request
                 "message": f"Failed to connect to upstream LLM provider: {str(exc)}",
                 "type": "server_error",
                 "param": None,
-                "code": "upstream_connection_failed"
+                "code": "upstream_connection_failed",
             }
-        }
+        },
     )
 
 
@@ -75,16 +228,15 @@ async def upstream_connection_error_handler(request: Request, exc: httpx.Request
 async def upstream_status_error_handler(request: Request, exc: httpx.HTTPStatusError):
     """Handles HTTP errors returned by the upstream LLM provider."""
     status_code = exc.response.status_code
-    
+
     try:
         upstream_error = exc.response.json()
         if "error" in upstream_error:
             return JSONResponse(status_code=status_code, content=upstream_error)
     except Exception:
         pass
-        
+
     error_msg = exc.response.text or str(exc)
-        
     return JSONResponse(
         status_code=status_code,
         content={
@@ -92,15 +244,29 @@ async def upstream_status_error_handler(request: Request, exc: httpx.HTTPStatusE
                 "message": f"Upstream LLM error: {error_msg}",
                 "type": "api_error",
                 "param": None,
-                "code": "upstream_api_error"
+                "code": "upstream_api_error",
             }
-        }
+        },
     )
 
 
+# ---------------------------------------------------------------------------
+# Utility routes
+# ---------------------------------------------------------------------------
+
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    """Returns gateway liveness and current queue utilisation metrics."""
+    warmup_task: asyncio.Task | None = getattr(app.state, "warmup_task", None)
+    warmup_status = (
+        "complete" if (warmup_task and warmup_task.done()) else "in_progress"
+        if warmup_task else "disabled"
+    )
+    return {
+        "status": "healthy",
+        "queue": queue_status(),
+        "warmup": warmup_status,
+    }
 
 
 if __name__ == "__main__":
