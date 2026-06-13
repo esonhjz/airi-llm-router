@@ -32,8 +32,10 @@ class OllamaAdapter(BaseLLMAdapter):
 
     def build_payload(self, generic_payload: dict[str, Any]) -> dict[str, Any]:
         payload = dict(generic_payload)
-        # Strip adapter prefix: "ollama:qwen2.5" → "qwen2.5"
+        # Only strip the adapter routing prefix "ollama:xxx".
+        # Ollama's own model:tag format (e.g. "qwen2.5:7b") must be preserved —
+        # the colon there is a version separator, not a routing prefix.
         model: str = payload.get("model", "")
-        if ":" in model:
-            payload["model"] = model.split(":", 1)[1]
+        if model.startswith("ollama:"):
+            payload["model"] = model[len("ollama:"):]
         return payload

@@ -10,3 +10,6 @@
 
 # Docker
 Dockerfile text eol=lf
+.dockerignore text eol=lf
+docker-compose.yml text eol=lf
+docker-compose.override.yml text eol=lf

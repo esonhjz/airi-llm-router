@@ -111,15 +111,31 @@ async def _backoff(attempt: int, exc: Exception) -> None:
 # ---------------------------------------------------------------------------
 
 def _make_error_chunk(exc: Exception) -> bytes:
-    """Converts any exception into an OpenAI-format JSON error block (bytes)."""
+    """Converts any exception into an OpenAI-format JSON error block (bytes).
+
+    Stream-safe: when an HTTPStatusError originates from a streaming context,
+    the response body may not have been read yet.  Accessing .text or .json()
+    in that state raises httpx.ResponseNotRead and kills the worker.  We guard
+    against this by catching the read-error and falling back to the status code.
+    """
     if isinstance(exc, httpx.HTTPStatusError):
         try:
-            upstream = exc.response.json()
-            if "error" in upstream:
-                return json.dumps(upstream).encode()
+            # response.is_stream_consumed guards against ResponseNotRead —
+            # if the body was never fully read (common in streaming errors),
+            # .json() / .text would crash.
+            if exc.response.is_stream_consumed:
+                upstream = exc.response.json()
+                if "error" in upstream:
+                    return json.dumps(upstream).encode()
         except Exception:
             pass
-        error_msg = exc.response.text or str(exc)
+
+        # Build a safe fallback message from the status code alone.
+        try:
+            error_msg = exc.response.text if exc.response.is_stream_consumed else ""
+        except Exception:
+            error_msg = ""
+        error_msg = error_msg or f"HTTP {exc.response.status_code}"
         code = "upstream_api_error"
     elif isinstance(exc, httpx.HTTPError):
         error_msg = f"Connection failed: {exc}"
@@ -247,12 +263,15 @@ async def _execute_stream(client: httpx.AsyncClient, task: RequestTask) -> None:
                 response.raise_for_status()
                 # Past raise_for_status — committed to this attempt, no more retries
 
-                async for raw_chunk in response.aiter_raw():
+                # aiter_bytes() handles HTTP chunked-transfer decoding internally,
+                # unlike aiter_raw() which yields raw socket bytes including
+                # transfer-encoding framing that would corrupt SSE parsing.
+                async for chunk in response.aiter_bytes():
                     if task.cancel_event.is_set():
                         print("[Worker] Stream cancelled — closing upstream connection")
                         break
-                    if raw_chunk:
-                        await task.chunk_queue.put(raw_chunk)
+                    if chunk:
+                        await task.chunk_queue.put(chunk)
                         chunks_sent += 1
 
         except httpx.HTTPError as exc:
@@ -261,13 +280,19 @@ async def _execute_stream(client: httpx.AsyncClient, task: RequestTask) -> None:
                 continue  # retry — no data sent yet, safe to start fresh
             error_bytes = _make_error_chunk(exc)
 
-        finally:
-            if error_bytes is not None:
-                await task.chunk_queue.put(error_bytes)
-            # Send sentinel only on final exit (not when continuing to next retry)
-            if error_bytes is not None or chunks_sent > 0 or task.cancel_event.is_set():
+        else:
+            # Stream completed successfully — break out of the retry loop.
+            # Without this break, the loop would fall through to the next attempt
+            # and open a second upstream connection, duplicating the entire stream.
+            if chunks_sent > 0 or task.cancel_event.is_set():
                 await task.chunk_queue.put(None)
                 return
+
+        # This block runs on error (except clause was entered)
+        if error_bytes is not None:
+            await task.chunk_queue.put(error_bytes)
+            await task.chunk_queue.put(None)
+            return
 
     # Retry loop exhausted without success
     await task.chunk_queue.put(None)

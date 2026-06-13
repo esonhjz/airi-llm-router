@@ -34,12 +34,15 @@ def get_adapter(model_name: str) -> BaseLLMAdapter:
     The model name itself is NOT modified here; prefix stripping is the
     responsibility of each adapter's build_payload() method.
     """
-    # 1. Prefix routing
+    # 1. Prefix routing — only when the part before ':' is a KNOWN adapter name.
+    #    Ollama uses ':' as a model:tag separator (e.g. "qwen2.5:7b"), which
+    #    must NOT be confused with our adapter prefix syntax ("ms:qwen-vl-plus").
     if ":" in model_name:
         prefix = model_name.split(":", 1)[0].lower()
-        adapter_name = _PREFIX_MAP.get(prefix)
-        if adapter_name and adapter_name in _ADAPTERS:
-            return _ADAPTERS[adapter_name]
+        if prefix in _PREFIX_MAP:
+            adapter_name = _PREFIX_MAP[prefix]
+            if adapter_name in _ADAPTERS:
+                return _ADAPTERS[adapter_name]
 
     # 2. Config routing table (substring match, evaluated in insertion order)
     for pattern, adapter_name in settings.model_routes.items():

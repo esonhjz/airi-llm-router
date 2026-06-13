@@ -25,13 +25,41 @@ A high-performance, asynchronous LLM routing gateway built with FastAPI and HTTP
 
 ## 📦 Getting Started
 
-### Prerequisites
-- Python 3.11+
-- An upstream LLM provider (e.g., [Ollama](https://ollama.com/) running locally or ModelScope API Key)
+### Option A — Docker (Recommended)
 
-### Installation
+Spin up the full stack (router + Ollama with GPU passthrough) in a single command:
 
-1. Clone the repository and navigate to the project directory:
+```bash
+# 1. Copy and edit the environment file
+cp .env.example .env               # set LLM_DEFAULT_MODEL, ports, etc.
+
+# 2. Start everything
+docker compose up --build -d       # builds the router image, pulls Ollama
+
+# 3. Pull a model into Ollama (first run only)
+docker exec airi-ollama ollama pull AiriLocal
+
+# 4. Verify
+curl http://localhost:8000/health   # {"status":"healthy","queue":...,"warmup":"complete"}
+```
+
+> **No NVIDIA GPU?** Delete the `deploy:` block inside `docker-compose.yml` under the `ollama` service before running. Ollama will fall back to CPU mode automatically.
+
+Stop and remove containers (model weights are preserved in the `ollama-data` volume):
+```bash
+docker compose down
+```
+
+Wipe everything including downloaded models:
+```bash
+docker compose down -v
+```
+
+---
+
+### Option B — Manual Installation
+
+
    ```bash
    git clone <repository_url>
    cd airi-llm-router
@@ -58,7 +86,8 @@ A high-performance, asynchronous LLM routing gateway built with FastAPI and HTTP
    
    # ModelScope (DashScope) Integration
    MODELSCOPE_API_KEY=your_dashscope_api_key
-   MODEL_ROUTES='{"qwen": "modelscope", "llama": "ollama"}'
+   # Use explicit prefixes like "ms:qwen-vl-plus" instead of broad substring rules.
+   # MODEL_ROUTES='{"gpt": "openai"}'
    ```
 
 ### Running the Router
@@ -89,6 +118,7 @@ pytest tests/ -v
 - **`src/router/dispatch.py`**: Core routing logic handling enqueueing, payload construction, and stream yielding.
 - **`src/adapters/`**: Routing strategy engine and backend-specific payload normalizers (`base.py`, `registry.py`, `ollama.py`, `modelscope.py`).
 - **`src/media/offload.py`**: Disk-backed memory optimization and reference counting garbage collection for Base64 streams.
+- **`tests/`**: Contains automated `pytest` test suites (`conftest.py` for ASGI simulation and routing logic tests).
 
 ## License
 

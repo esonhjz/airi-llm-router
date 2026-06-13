@@ -50,6 +50,7 @@ coverage.xml
 cover/
 
 # Environments
+# .env.example is intentionally tracked in git (contains no secrets)
 .env
 .venv
 env/
@@ -57,6 +58,9 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Docker Compose local overrides
+docker-compose.override.yml
 
 # Editors / OS
 .vscode/
