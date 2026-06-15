@@ -25,34 +25,26 @@ A high-performance, asynchronous LLM routing gateway built with FastAPI and HTTP
 
 ## 📦 Getting Started
 
-### Option A — Docker (Recommended)
+### Option A — Docker (Gateway Only)
 
-Spin up the full stack (router + Ollama with GPU passthrough) in a single command:
+Spin up the containerized router using Docker Compose. This assumes your Ollama instance is already running natively on the host machine.
 
 ```bash
 # 1. Copy and edit the environment file
-cp .env.example .env               # set LLM_DEFAULT_MODEL, ports, etc.
+cp .env.example .env
 
-# 2. Start everything
-docker compose up --build -d       # builds the router image, pulls Ollama
+# 2. Start the gateway
+docker compose up --build -d
 
-# 3. Pull a model into Ollama (first run only)
-docker exec airi-ollama ollama pull AiriLocal
-
-# 4. Verify
-curl http://localhost:8000/health   # {"status":"healthy","queue":...,"warmup":"complete"}
+# 3. Verify
+curl http://localhost:8000/health
 ```
 
-> **No NVIDIA GPU?** Delete the `deploy:` block inside `docker-compose.yml` under the `ollama` service before running. Ollama will fall back to CPU mode automatically.
+> **Note:** The `docker-compose.yml` uses `host.docker.internal` to reach your native Ollama on `localhost:11434`. It also requires an NVIDIA GPU for the VRAM probe to function (`deploy.resources.reservations.devices`).
 
-Stop and remove containers (model weights are preserved in the `ollama-data` volume):
+Stop and remove the container:
 ```bash
 docker compose down
-```
-
-Wipe everything including downloaded models:
-```bash
-docker compose down -v
 ```
 
 ---
