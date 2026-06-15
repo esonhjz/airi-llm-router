@@ -117,7 +117,12 @@ pytest tests/ -v
 - **`src/queue/worker.py`**: Consumer background tasks managing backpressure, upstream retries, image restoration, and graceful cancellation.
 - **`src/router/dispatch.py`**: Core routing logic handling enqueueing, payload construction, and stream yielding.
 - **`src/adapters/`**: Routing strategy engine and backend-specific payload normalizers (`base.py`, `registry.py`, `ollama.py`, `modelscope.py`).
-- **`src/media/offload.py`**: Disk-backed memory optimization and reference counting garbage collection for Base64 streams.
+- **`src/media/`**: Offloads incoming Base64 images to local temporary files to prevent JSON payload blobs from choking the RAM.
+- **`src/monitor/`**: `vram.py` polls physical GPU memory via `pynvml` at 1.0s intervals, serving as the hardware-aware engine for dynamic backpressure.
+- **`src/logger.py`**: Centralized JSON-structured logging engine for high-observability parsing (captures `vram_percent`, `event_type`, etc.).
+- **`tests/benchmarks/`**: Official performance testing assets (e.g. `test_stress.py`) used to simulate concurrency spikes and validate the anti-OOM circuit breakers.
+
+## Roadmap & Known Limitations
 - **`tests/`**: Contains automated `pytest` test suites (`conftest.py` for ASGI simulation and routing logic tests).
 
 ## License

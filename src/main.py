@@ -11,6 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from src.config import settings
+from src.middleware.circuit_breaker import VramCircuitBreakerMiddleware
+from src.monitor.vram import gpu_status, start_monitor, stop_monitor
 from src.queue.worker import queue_consumer, queue_status
 from src.router.dispatch import router as dispatch_router
 
@@ -147,12 +149,15 @@ async def lifespan(app: FastAPI):
     app.state.http_client = client
     print(f"[Lifespan] 🚀 Connection pool ready (max_conn={settings.pool_max_connections}, http2=True)")
 
-    # Phase 2 — Warmup probe (non-blocking: launched as a background task so
+    # Phase 2 — VRAM monitor (non-blocking background probe)
+    await start_monitor()
+
+    # Phase 3 — Warmup probe (non-blocking: launched as a background task so
     # the gateway starts serving traffic while the probe retries in the background)
     warmup_task = asyncio.create_task(_run_warmup(client))
     app.state.warmup_task = warmup_task
 
-    # Phase 3 — Queue workers
+    # Phase 4 — Queue workers
     workers: list[asyncio.Task] = []
     for i in range(settings.queue_worker_count):
         t = asyncio.create_task(queue_consumer(client, worker_id=i))
@@ -164,7 +169,7 @@ async def lifespan(app: FastAPI):
 
     yield  # ── gateway is live ──
 
-    # Phase 4 — Cancel workers
+    # Phase 5 — Cancel workers
     for t in workers:
         t.cancel()
     await asyncio.gather(*workers, return_exceptions=True)
@@ -178,7 +183,10 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
-    # Phase 5 — Connection pool teardown
+    # Phase 6 — VRAM monitor teardown (releases NVML C driver handle)
+    await stop_monitor()
+
+    # Phase 7 — Connection pool teardown
     await client.aclose()
     print("[Lifespan] 🛑 Connection pool released")
 
@@ -193,6 +201,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Middleware stack — execution order is bottom-to-top:
+# 1. CORS headers (outermost)
+# 2. VRAM circuit breaker (fires before body parsing)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -200,6 +211,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(VramCircuitBreakerMiddleware)
 
 app.include_router(dispatch_router)
 
@@ -256,15 +268,24 @@ async def upstream_status_error_handler(request: Request, exc: httpx.HTTPStatusE
 
 @app.get("/health")
 async def health_check():
-    """Returns gateway liveness and current queue utilisation metrics."""
+    """Returns gateway liveness, queue utilisation, and GPU VRAM metrics."""
     warmup_task: asyncio.Task | None = getattr(app.state, "warmup_task", None)
     warmup_status = (
         "complete" if (warmup_task and warmup_task.done()) else "in_progress"
         if warmup_task else "disabled"
     )
+    snap = gpu_status()
+    gpu_info = {
+        "available": snap.available,
+        "zone": snap.zone.value,
+        "usage_pct": snap.usage_pct,
+        "used_mb": snap.used_mb,
+        "total_mb": snap.total_mb,
+    }
     return {
         "status": "healthy",
         "queue": queue_status(),
+        "gpu": gpu_info,
         "warmup": warmup_status,
     }
 

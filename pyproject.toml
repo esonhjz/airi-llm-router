@@ -1,6 +1,6 @@
 [project]
 name = "airi-llm-router"
-version = "0.1.0"
+version = "0.2.0"
 description = "Async LLM Router for Airi"
 authors = [
     { name = "esonhjz", email = "hyh20080809@gmail.com" }
@@ -10,6 +10,7 @@ dependencies = [
     "uvicorn",
     "pydantic-settings",
     "httpx[http2]",
+    "nvidia-ml-py",       # NVML bindings for GPU VRAM monitoring
 ]
 
 [build-system]

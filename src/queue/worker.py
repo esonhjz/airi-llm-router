@@ -52,10 +52,14 @@ class RequestTask:
 
 
 # ---------------------------------------------------------------------------
-# Global bounded queue — top-level backpressure valve.
+# Global multi-tier queues
 # ---------------------------------------------------------------------------
 
-request_queue: asyncio.Queue[RequestTask] = asyncio.Queue(maxsize=settings.queue_max_size)
+high_speed_queue: asyncio.Queue[RequestTask] = asyncio.Queue(maxsize=settings.queue_max_size)
+batch_queue: asyncio.Queue[RequestTask] = asyncio.Queue(maxsize=settings.queue_max_size)
+
+# Event to wake up consumers when an item is added to either queue.
+task_added_event = asyncio.Event()
 
 
 # ---------------------------------------------------------------------------
@@ -304,16 +308,29 @@ async def _execute_stream(client: httpx.AsyncClient, task: RequestTask) -> None:
 
 async def queue_consumer(client: httpx.AsyncClient, worker_id: int) -> None:
     """
-    Long-running consumer loop.
+    Long-running consumer loop with dynamic priority polling.
 
-    Serialises one request at a time, limiting true upstream concurrency to
-    queue_worker_count. Handles image cleanup in a finally block so temp files
-    are always released regardless of success, failure, or cancellation.
+    Worker always checks high_speed_queue first. If empty, it checks batch_queue.
+    If both are empty, it waits efficiently without losing items.
     """
     print(f"[Queue] Worker-{worker_id} started")
     try:
         while True:
-            task = await request_queue.get()
+            # 1. Priority check
+            if not high_speed_queue.empty():
+                task = high_speed_queue.get_nowait()
+                q = high_speed_queue
+            elif not batch_queue.empty():
+                task = batch_queue.get_nowait()
+                q = batch_queue
+            else:
+                # Safe wait pattern to avoid race conditions
+                task_added_event.clear()
+                if high_speed_queue.empty() and batch_queue.empty():
+                    await task_added_event.wait()
+                continue
+
+            # 2. Process task
             try:
                 if task.stream:
                     await _execute_stream(client, task)
@@ -322,7 +339,7 @@ async def queue_consumer(client: httpx.AsyncClient, worker_id: int) -> None:
             finally:
                 if task.has_offloaded_images:
                     release_images(task.payload)
-                request_queue.task_done()
+                q.task_done()
     except asyncio.CancelledError:
         print(f"[Queue] Worker-{worker_id} shutting down")
 
@@ -332,11 +349,19 @@ async def queue_consumer(client: httpx.AsyncClient, worker_id: int) -> None:
 # ---------------------------------------------------------------------------
 
 def queue_status() -> dict[str, Any]:
-    """Returns a real-time snapshot of global queue metrics."""
-    size = request_queue.qsize()
-    max_size = request_queue.maxsize
+    """Returns a real-time snapshot of multi-tier queue metrics."""
+    hs_size = high_speed_queue.qsize()
+    b_size = batch_queue.qsize()
+    max_size = settings.queue_max_size
     return {
-        "current_size": size,
-        "max_size": max_size,
-        "utilization": f"{size / max_size * 100:.1f}%",
+        "high_speed": {
+            "current_size": hs_size,
+            "max_size": max_size,
+            "utilization": f"{hs_size / max_size * 100:.1f}%",
+        },
+        "batch": {
+            "current_size": b_size,
+            "max_size": max_size,
+            "utilization": f"{b_size / max_size * 100:.1f}%",
+        }
     }

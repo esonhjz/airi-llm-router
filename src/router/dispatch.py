@@ -8,9 +8,12 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from src.adapters.registry import get_adapter
+from src.classifier import classify_request, RequestLabel
 from src.config import settings
+from src.logger import log_event
 from src.media.offload import offload_images
-from src.queue.worker import RequestTask, request_queue
+from src.monitor.vram import gpu_status, VramZone, retry_after_hint
+from src.queue.worker import RequestTask, high_speed_queue, batch_queue, task_added_event
 from src.router.schemas import ChatCompletionRequest
 
 router = APIRouter(prefix="/v1", tags=["LLM Dispatch"])
@@ -52,22 +55,44 @@ def build_upstream_payload(body: ChatCompletionRequest) -> dict[str, Any]:
     return payload
 
 
-def _queue_full_response() -> JSONResponse:
-    """Standard 429 response when the request queue is saturated."""
+def _queue_full_response(queue_name: str, max_size: int) -> JSONResponse:
+    """Standard 429 response when a request queue is saturated."""
     return JSONResponse(
         status_code=429,
         content={
             "error": {
                 "message": (
-                    f"Server overloaded. Request queue is full "
-                    f"({request_queue.maxsize}/{request_queue.maxsize}). "
-                    "Please retry later."
+                    f"Server overloaded. {queue_name} queue is full "
+                    f"({max_size}/{max_size}). Please retry later."
                 ),
                 "type": "server_error",
                 "param": None,
                 "code": "queue_full",
             }
         },
+    )
+
+
+def _soft_throttle_response(retry: int) -> JSONResponse:
+    """429 response for HEAVY/MULTIMODAL tasks during WARNING (Soft-Throttling)."""
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": {
+                "message": (
+                    "Server is experiencing high load (Warning Zone). "
+                    "Heavy and multimodal requests are temporarily throttled to preserve VRAM. "
+                    "Please retry later."
+                ),
+                "type": "server_error",
+                "param": None,
+                "code": "soft_throttled",
+            }
+        },
+        headers={
+            "Retry-After": str(retry),
+            "X-VRAM-Status": "Warning",
+        }
     )
 
 
@@ -150,13 +175,32 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     """
     payload = build_upstream_payload(body)
 
-    # Step 2 — Adapter resolution (prefix → config table → default)
-    adapter = get_adapter(payload["model"])
+    # Step 2 — Feature Evaluation & VRAM-Aware Soft Throttling
+    label = classify_request(payload)
+    snap = gpu_status()
 
-    # Step 3 — Image offloading: strip large base64 blobs, replace with imgref: pointers
+    if snap.zone == VramZone.WARNING and label in (RequestLabel.HEAVY, RequestLabel.MULTIMODAL):
+        log_event(
+            event_type="soft_throttle",
+            target=payload.get("model", "unknown_model"),
+            client_ip=request.client.host if request.client else "unknown",
+            vram_percent=snap.usage_pct,
+            msg="Request throttled due to WARNING VRAM levels",
+            label=label.value
+        )
+        return _soft_throttle_response(retry=retry_after_hint())
+
+    # Step 3 — Adapter resolution
+    if label == RequestLabel.MULTIMODAL:
+        # Override adapter to ModelScope for local visual reasoning
+        adapter = get_adapter("ms:" + payload["model"])
+    else:
+        adapter = get_adapter(payload["model"])
+
+    # Step 4 — Image offloading: strip large base64 blobs, replace with imgref: pointers
     payload, had_offloads = offload_images(payload)
 
-    # Step 4 — Enqueue
+    # Step 5 — Enqueue
     task = RequestTask(
         payload=payload,
         adapter=adapter,
@@ -164,16 +208,22 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         has_offloaded_images=had_offloads,
     )
 
+    target_queue = high_speed_queue if label == RequestLabel.LIGHTWEIGHT else batch_queue
+
     try:
-        request_queue.put_nowait(task)
+        target_queue.put_nowait(task)
+        task_added_event.set()  # Wake up workers
     except asyncio.QueueFull:
         if had_offloads:
             # Release temp files immediately — task will never be processed
             from src.media.offload import release_images
             release_images(payload)
-        return _queue_full_response()
+        return _queue_full_response(
+            queue_name=label.queue_tier,
+            max_size=target_queue.maxsize
+        )
 
-    # Step 5a — Streaming
+    # Step 6a — Streaming
     if body.stream:
         return StreamingResponse(
             _stream_from_queue(task, request),

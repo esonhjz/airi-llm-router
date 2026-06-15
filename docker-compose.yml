@@ -3,19 +3,18 @@
 # Services
 # ────────
 #  router  — Airi LLM Router (this repo)
-#  ollama  — Local Ollama inference engine with optional GPU passthrough
 #
-# GPU note
-# ────────
-# The `ollama` service is pre-configured for NVIDIA GPU passthrough via the
-# `deploy.resources.reservations` block.  If you don't have an NVIDIA GPU,
-# delete the entire `deploy:` section and Ollama will fall back to CPU mode.
+# Ollama
+# ──────
+# This compose file assumes Ollama is running natively on the Windows host.
+# The router reaches it via `host.docker.internal` (Docker's magic DNS that
+# resolves to the host machine's loopback address from inside a container).
 #
 # Quickstart
 # ──────────
 #   cp .env.example .env          # fill in your model name
-#   docker compose up --build -d  # build router image and start all services
-#   docker compose logs -f        # tail logs from both services
+#   docker compose up --build -d  # build router image and start
+#   docker compose logs -f        # tail logs
 #   docker compose down           # stop and remove containers
 
 services:
@@ -35,7 +34,10 @@ services:
     environment:
       # Forward all variables from the host .env file into the container.
       # Any value set here overrides the default defined in src/config.py.
-      LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama:11434/v1}
+      #
+      # host.docker.internal lets the container reach the Windows-native Ollama
+      # that is listening on the host's localhost:11434.
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434/v1}
       LLM_API_KEY: ${LLM_API_KEY:-ollama}
       LLM_DEFAULT_MODEL: ${LLM_DEFAULT_MODEL:-AiriLocal}
       QUEUE_MAX_SIZE: ${QUEUE_MAX_SIZE:-64}
@@ -46,11 +48,22 @@ services:
       MODEL_ROUTES: ${MODEL_ROUTES:-{}}
       DEFAULT_ADAPTER: ${DEFAULT_ADAPTER:-ollama}
       IMAGE_OFFLOAD_ENABLED: ${IMAGE_OFFLOAD_ENABLED:-true}
-    depends_on:
-      ollama:
-        condition: service_started
+      VRAM_MONITOR_ENABLED: ${VRAM_MONITOR_ENABLED:-true}
+      VRAM_GPU_INDEX: ${VRAM_GPU_INDEX:-0}
+      VRAM_THRESHOLD_WARNING: ${VRAM_THRESHOLD_WARNING:-75.0}
+      VRAM_THRESHOLD_DANGER: ${VRAM_THRESHOLD_DANGER:-85.0}
     networks:
       - airi-net
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -58,36 +71,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
-
-  # ─── Ollama inference engine ────────────────────────────────────────────────
-  ollama:
-    image: ollama/ollama:latest
-    container_name: airi-ollama
-    restart: unless-stopped
-    volumes:
-      # Persist downloaded model weights across container restarts.
-      - ollama-data:/root/.ollama
-    ports:
-      # Expose directly for debugging; the router uses the internal network.
-      - "${OLLAMA_PORT:-11434}:11434"
-    networks:
-      - airi-net
-
-    # ── NVIDIA GPU passthrough ──────────────────────────────────────────────
-    # Remove the entire `deploy:` block if you do not have an NVIDIA GPU.
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all          # pass through all available GPUs
-              capabilities: [gpu]
-
-# ─── Named volumes ──────────────────────────────────────────────────────────
-volumes:
-  ollama-data:
-    # Keeps model files on the Docker-managed volume even after `compose down`.
-    # Use `docker compose down -v` only when you intentionally want to wipe models.
 
 # ─── Internal bridge network ─────────────────────────────────────────────────
 networks:

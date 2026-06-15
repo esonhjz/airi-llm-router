@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     queue_max_size: int = 64
     queue_worker_count: int = 4
 
+    # Classification thresholds
+    classifier_heavy_max_tokens: int = 1024
+    classifier_heavy_prompt_chars: int = 2048
+
     # Upstream retry policy
     # Retries apply only to transient faults (5xx, 429, connection errors).
     # Permanent client errors (4xx except 429) are never retried.
@@ -55,6 +59,20 @@ class Settings(BaseSettings):
     # only a lightweight 'imgref:{hash}' pointer is held in the queue.
     image_offload_enabled: bool = True
     image_offload_threshold: int = 10_240    # bytes (~7.5 KB of raw binary after decode)
+
+    # GPU VRAM monitoring (requires nvidia-ml-py / pynvml).
+    # When enabled, the gateway reads physical GPU memory at vram_poll_interval
+    # and enforces a three-zone circuit breaker (safe / warning / danger).
+    # If pynvml is missing or NVML init fails, the gateway silently falls back
+    # to static queue thresholds — no crash, no false-positive blocks.
+    vram_monitor_enabled: bool = True
+    vram_gpu_index: int = 0                       # which GPU to watch (multi-GPU: pick primary)
+    vram_poll_interval: float = 1.0               # seconds between NVML reads
+    vram_threshold_warning: float = 75.0          # % — soft throttle starts
+    vram_threshold_danger: float = 85.0           # % — hard circuit-break
+    vram_max_probe_failures: int = 3              # consecutive NVML read failures before fallback
+    vram_retry_after_min: int = 2                 # min Retry-After jitter (seconds)
+    vram_retry_after_max: int = 5                 # max Retry-After jitter (seconds)
 
     model_config = {
         "env_file": ".env",
