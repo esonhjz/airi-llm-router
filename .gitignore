@@ -71,4 +71,5 @@ docker-compose.override.yml
 Thumbs.db
 
 # Benchmark logs
-tests/benchmarks/logs/
+tests/benchmarks/logs/*
+!tests/benchmarks/logs/*.png

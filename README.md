@@ -17,7 +17,7 @@ graph TD
     classDef engine fill:#2d0a28,stroke:#ff0055,stroke-width:2px,color:#fff;
     classDef queue fill:#0d1117,stroke:#ff6600,stroke-width:1px,stroke-dasharray: 5 5,color:#fff;
 
-    Client["📱 Airi Companion<br>(Frontend)"]:::client
+    Client["📱 Airi<br>(Frontend)"]:::client
     
     subgraph "Airi LLM Router"
         API["FastAPI /v1/chat/completions"]:::gateway
@@ -39,6 +39,9 @@ graph TD
     Monitor -- "VRAM > 85%" --> Drop["HTTP 429 (Drop)"]
     Monitor -- "VRAM > 75%" --> Throttle{"Heavy Payload?"}
     Throttle -- "Yes" --> Drop2["HTTP 429 (Soft Throttle)"]
+    
+    Drop -. "SmartFetch Retry-After" .-> Client
+    Drop2 -. "SmartFetch Retry-After" .-> Client
     
     Monitor -- "< 75%" --> Classifier
     Throttle -- "No" --> Classifier
@@ -70,23 +73,28 @@ A strict pool of `N` asynchronous workers (aligned with the GPU's max parallel t
 
 ---
 
-## 3. Benchmark
+## 3. Benchmark & Validation
 
 ### Test Environment
 - **GPU**: NVIDIA RTX 5070 Ti (16GB VRAM)
-- **Model**: Qwen 2.5 (7B) via Ollama
-- **Methodology**: 150 concurrent mixed payloads (lightweight + heavy) over 15 seconds.
-- **Comparison**: v2 (Single Async FIFO Queue) vs. v3 (Dual Queues + VRAM Throttling).
+- **Engine**: Qwen 2.5 (7B) via Ollama
+- **Load**: 150 concurrent mixed requests (70% lightweight, 30% heavy tasks).
 
-### Head-of-Line Blocking Resolution
-Routing lightweight requests through the High-Speed queue bypassed blocking from heavy document tasks. 
-**Result**: 96.6% P95 latency reduction (from ~35s down to 1.2s).
+### 3.1 Head-of-Line (HoL) Blocking Resolution
+By routing conversational tasks to the **High-Speed Queue** via the `Payload Classifier`, lightweight queries bypass heavy document processing entirely.
+
+- **Lightweight Chat**: P95 latency dropped from **14.6s** to **1.5s** (**89.7% reduction**).
+- **Heavy Context**: Maintained a stable execution path (15.1s to 17.2s).
 
 ![Latency Reduction](tests/benchmarks/logs/vs_latency_reduction.png)
 
-### VRAM Backpressure Performance
-Under heavy concurrent load (v2), unbounded queues led to severe request accumulation and client-side timeouts. In v3, the circuit breaker actively intercepted payloads when VRAM crossed 75%/85%, executing controlled load shedding (HTTP 429).
-**Result**: VRAM allocation remained strictly bounded below the 85% Danger threshold, ensuring the underlying GPU never experienced Out-Of-Memory exceptions, while safe capacity (HTTP 200) was processed smoothly.
+### 3.2 VRAM & Concurrency Backpressure
+Ollama pre-allocates VRAM statically (**62%** baseline), so concurrent stress shifts entirely into **inference queuing delays (Latency)**.
+
+1. **Queue Buildup (0s - 12s)**: 150 requests flood the gateway. Response latencies climb while physical VRAM remains flat at 62%.
+2. **Backpressure Trigger (13.1s)**: The circuit breaker activates at the 75% WARNING timeline to prevent system timeouts.
+3. **Load Shedding**: The router drops heavy incoming traffic and returns **HTTP 429 Throttled** (crimson `X` markers).
+4. **Client-Side Handling**: The `smartFetch` interceptor catches 429s, applies a `setTimeout` retry sleep, and dispatches an `airi-vram-warning` event to let the UI show a gentle waiting notice instead of crashing.
 
 ![VRAM Backpressure](tests/benchmarks/logs/vs_vram_backpressure.png)
 

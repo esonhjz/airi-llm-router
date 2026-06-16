@@ -17,7 +17,7 @@ graph TD
     classDef engine fill:#2d0a28,stroke:#ff0055,stroke-width:2px,color:#fff;
     classDef queue fill:#0d1117,stroke:#ff6600,stroke-width:1px,stroke-dasharray: 5 5,color:#fff;
 
-    Client["📱 Airi Companion<br>(前端)"]:::client
+    Client["📱 Airi<br>(前端)"]:::client
     
     subgraph "Airi LLM Router"
         API["FastAPI /v1/chat/completions"]:::gateway
@@ -39,6 +39,9 @@ graph TD
     Monitor -- "VRAM > 85%" --> Drop["HTTP 429 (硬拦截)"]
     Monitor -- "VRAM > 75%" --> Throttle{"重负载?"}
     Throttle -- "是" --> Drop2["HTTP 429 (软节流)"]
+    
+    Drop -. "SmartFetch 退避重试" .-> Client
+    Drop2 -. "SmartFetch 退避重试" .-> Client
     
     Monitor -- "< 75%" --> Classifier
     Throttle -- "否" --> Classifier
@@ -70,25 +73,30 @@ graph TD
 
 ---
 
-## 3. 基准测试 (Benchmark)
+## 3. 基准测试与性能验证
 
 ### 测试环境
 - **GPU**: NVIDIA RTX 5070 Ti (16GB VRAM)
-- **Model**: Qwen 2.5 (7B) via Ollama
-- **Methodology**: 在 15 秒内并发注入 150 个混合负载（轻负载 + 重负载）。
-- **Comparison**: v2（单异步 FIFO 队列）vs. v3（双轨队列 + VRAM 熔断器）。
+- **大模型引擎**: Qwen 2.5 (7B) 基于 Ollama
+- **测试负载**: 150 个高并发混合请求（70% 轻量对话，30% 重型长文本）。
 
-### 消除队头阻塞 (HoL Blocking)
-将轻量级请求路由至高速队列，使其绕过了被重度文档任务阻塞的问题。
-**结果**：P95 延迟骤降 96.6%（从约 35 秒降低至 1.2 秒）。
+### 3.1 队头阻塞（HoL Blocking）消除验证
+通过 `Payload Classifier` 将常规对话分流至 **High-Speed Queue（高速队列）**，轻量请求彻底绕过了重型任务的排队等待。
 
-![Latency Reduction](tests/benchmarks/logs/vs_latency_reduction.png)
+- **轻量级对话**: P95 响应延迟从 **14.6 秒**暴降至 **1.5 秒**（**时延消减 89.7%**）。
+- **重型密集文本**: 响应时间稳定在 15.1s 至 17.2s 之间。
 
-### VRAM 回压机制 (Backpressure)
-在高并发负载下（v2），无限制的队列导致请求严重堆积及客户端超时。在 v3 架构中，当显存突破 75%/85% 时，熔断器主动拦截过载请求，执行受控的流量卸载（HTTP 429）。
-**结果**：显存占用被严格控制在 85% 危险阈值以下，确保底层 GPU 始终免受 OOM（显存溢出）崩溃威胁，同时安全容量内的请求（HTTP 200）得以平稳处理。
+![时延消减对比图](tests/benchmarks/logs/vs_latency_reduction.png)
 
-![VRAM Backpressure](tests/benchmarks/logs/vs_vram_backpressure.png)
+### 3.2 显存限制与并发背压生命周期
+Ollama 原生采用显存预分配机制（稳定在 **62%** 基线），因此并发冲击不会体现在显存上涨上，而是完全转化为**推理排队延迟（Latency）**。
+
+1. **队列堆积期 (0s - 12s)**：150 个请求轰炸网关，引擎内部缓存队列迅速饱和，导致响应延迟上扬，而物理显存保持在 62%。
+2. **流控触发点 (13.1s)**：延迟逼近超时临界点，硬件熔断器在 75% WARNING 警戒线时间点后介入。
+3. **精准负载舍弃**：网关拒绝放行后续超载任务，直接向客户端弹回 **HTTP 429 保护拦截**（红色 `X` 标记）。
+4. **前端自适应闭环**：`airi-launcher.js` 注入的 `smartFetch` 拦截器捕获 429 信号并执行异步休眠（`setTimeout`）以推迟重试，同时抛出 `airi-vram-warning` 事件，使 UI 渲染黄色等待提示，避免红屏崩溃。
+
+![显存背压控制图](tests/benchmarks/logs/vs_vram_backpressure.png)
 
 ---
 
