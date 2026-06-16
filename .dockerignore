@@ -35,3 +35,6 @@ Thumbs.db
 
 # Local development docs
 Journal/
+
+# Launcher scripts
+airi-launcher.js

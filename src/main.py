@@ -204,6 +204,7 @@ app = FastAPI(
 # Middleware stack — execution order is bottom-to-top:
 # 1. CORS headers (outermost)
 # 2. VRAM circuit breaker (fires before body parsing)
+app.add_middleware(VramCircuitBreakerMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -211,7 +212,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.add_middleware(VramCircuitBreakerMiddleware)
 
 app.include_router(dispatch_router)
 
@@ -265,6 +265,21 @@ async def upstream_status_error_handler(request: Request, exc: httpx.HTTPStatusE
 # ---------------------------------------------------------------------------
 # Utility routes
 # ---------------------------------------------------------------------------
+
+@app.get("/v1/models")
+async def list_models():
+    """Returns a mock list of models so the frontend UI doesn't 404."""
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": settings.llm_default_model or "default-model",
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "airi-router"
+            }
+        ]
+    }
 
 @app.get("/health")
 async def health_check():
